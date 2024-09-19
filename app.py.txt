@@ -1,0 +1,230 @@
+from flask import Flask, request, jsonify
+import os
+from langchain_community.llms import Ollama
+from langchain_community.vectorstores import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
+from langchain_community.document_loaders import PDFPlumberLoader
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+from langchain.prompts import PromptTemplate
+
+app = Flask(__name__)
+
+folder_path = "db"
+pdf_folder = "pdf"
+
+# Initialize the LLM model
+cached_llm = Ollama(model="llama3")
+
+# Initialize the embedding model
+embedding = FastEmbedEmbeddings()
+
+# Text splitter configuration
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1024, chunk_overlap=80, length_function=len, is_separator_regex=False
+)
+
+# Prompt template
+raw_prompt = PromptTemplate.from_template(
+    """ 
+    <s>[INST] You are a technical assistant good at searching documents. If you do not have an answer from the provided information say so. [/INST] </s>
+    [INST] {input}
+           Context: {context}
+           Answer:
+    [/INST]
+"""
+)
+
+# Function to initialize the vector store
+def initialize_vector_store():
+    return Chroma(persist_directory=folder_path, embedding_function=embedding)
+
+# Function to create the chain
+def create_chain():
+    vector_store = initialize_vector_store()
+    retriever = vector_store.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"k": 20, "score_threshold": 0.1},
+    )
+    document_chain = create_stuff_documents_chain(cached_llm, raw_prompt)
+    return create_retrieval_chain(retriever, document_chain)
+
+# Endpoint to handle general AI queries directly with Ollama
+@app.route("/direct_ai", methods=["POST"])
+def direct_ai_post():
+    print("Post /direct_ai called")
+    json_content = request.json
+    query = json_content.get("query")
+    if not query:
+        return jsonify({"error": "Query parameter is missing"}), 400
+
+    print(f"query: {query}")
+    response = cached_llm.invoke(query)
+    print(response)
+
+    response_answer = {"answer": response}
+    return jsonify(response_answer)
+
+# Endpoint to handle PDF-related queries
+@app.route("/ask_pdf", methods=["POST"])
+def askPDFPost():
+    print("Post /ask_pdf called")
+    json_content = request.json
+    query = json_content.get("query")
+    if not query:
+        return jsonify({"error": "Query parameter is missing"}), 400
+
+    print(f"query: {query}")
+
+    print("Creating chain")
+    chain = create_chain()
+    result = chain.invoke({"input": query})
+
+    print(result)
+    sources = [
+        {"source": doc.metadata["source"], "page_content": doc.page_content}
+        for doc in result["context"]
+    ]
+
+    response_answer = {"answer": result["answer"], "sources": sources}
+    return jsonify(response_answer)
+
+# Endpoint to upload and process a PDF
+@app.route("/pdf", methods=["POST"])
+def pdfPost():
+    file = request.files["file"]
+    if not file:
+        return jsonify({"error": "File parameter is missing"}), 400
+    
+    file_name = file.filename
+    save_file = os.path.join(pdf_folder, file_name)
+    file.save(save_file)
+    print(f"filename: {file_name}")
+
+    loader = PDFPlumberLoader(save_file)
+    docs = loader.load_and_split()
+    print(f"docs len={len(docs)}")
+
+    chunks = text_splitter.split_documents(docs)
+    print(f"chunks len={len(chunks)}")
+
+    vector_store = Chroma.from_documents(
+        documents=chunks, embedding=embedding, persist_directory=folder_path
+    )
+
+    vector_store.persist()
+
+    response = {
+        "status": "Successfully Uploaded",
+        "filename": file_name,
+        "doc_len": len(docs),
+        "chunks": len(chunks),
+    }
+    return jsonify(response)
+
+# Endpoint to index and store all PDF files in a folder
+@app.route("/index_pdf_folder", methods=["POST"])
+def index_pdf_folder():
+    if not os.path.exists(pdf_folder):
+        return jsonify({"error": f"The folder '{pdf_folder}' does not exist."}), 400
+
+    all_docs = []
+    for file_name in os.listdir(pdf_folder):
+        if file_name.endswith(".pdf"):
+            file_path = os.path.join(pdf_folder, file_name)
+            print(f"Processing file: {file_path}")
+            loader = PDFPlumberLoader(file_path)
+            docs = loader.load_and_split()
+            all_docs.extend(docs)
+            print(f"Added {len(docs)} documents from {file_name}")
+
+    chunks = text_splitter.split_documents(all_docs)
+    print(f"Total chunks len={len(chunks)}")
+
+    vector_store = Chroma.from_documents(
+        documents=chunks, embedding=embedding, persist_directory=folder_path
+    )
+
+    vector_store.persist()
+
+    response = {
+        "status": "Successfully Indexed All PDFs",
+        "total_docs": len(all_docs),
+        "total_chunks": len(chunks),
+    }
+    return jsonify(response)
+
+
+
+# Endpoint to upload a PDF and add its content to Llama3
+@app.route("/upload_pdf_llama3", methods=["POST"])
+def upload_pdf_llama3():
+    print("Post /upload_pdf_llama3 called")
+    file = request.files["file"]
+    if not file:
+        return jsonify({"error": "File parameter is missing"}), 400
+
+    file_name = file.filename
+    save_file = os.path.join(pdf_folder, file_name)
+    file.save(save_file)
+    print(f"Saved file: {save_file}")
+
+    loader = PDFPlumberLoader(save_file)
+    docs = loader.load_and_split()
+    print(f"docs len={len(docs)}")
+
+    chunks = text_splitter.split_documents(docs)
+    print(f"chunks len={len(chunks)}")
+
+    vector_store = Chroma.from_documents(
+        documents=chunks, embedding=embedding, persist_directory=folder_path
+    )
+
+    vector_store.persist()
+
+    response = {
+        "status": "Successfully Uploaded",
+        "filename": file_name,
+        "doc_len": len(docs),
+        "chunks": len(chunks),
+    }
+    return jsonify(response)
+
+# Endpoint to ask Llama3 for information from uploaded PDFs
+@app.route("/ask_llama3", methods=["POST"])
+def ask_llama3():
+    print("Post /ask_llama3 called")
+    json_content = request.json
+    query = json_content.get("query")
+    if not query:
+        return jsonify({"error": "Query parameter is missing"}), 400
+
+    print(f"query: {query}")
+
+    print("Creating chain")
+    chain = create_chain()
+    result = chain.invoke({"input": query})
+
+    print(result)
+    sources = [
+        {"source": doc.metadata["source"], "page_content": doc.page_content}
+        for doc in result["context"]
+    ]
+
+    response_answer = {"answer": result["answer"], "sources": sources}
+    return jsonify(response_answer)
+
+
+
+def start_app(port=8080):
+    app.run(host="0.0.0.0", port=port, debug=True)
+
+if __name__ == "__main__":
+    # Check if a port number is provided as a command-line argument
+    if len(sys.argv) > 1:
+        port = int(sys.argv[1])
+    else:
+        port = 8080  # Default port
+
+    start_app(port=port)
